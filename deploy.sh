@@ -388,6 +388,7 @@ STATE_NONE = 0
 STATE_WAIT_ADD_ID = 1
 STATE_WAIT_DEL_ID = 2
 STATE_WAIT_MANUAL_EMAIL = 3
+STATE_WAIT_MANUAL_PASSWORD = 4
 
 PERSISTENT_KEYBOARD = ReplyKeyboardMarkup([["☰ 菜单"]], resize_keyboard=True, is_persistent=True)
 
@@ -396,9 +397,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['state'] = STATE_NONE 
     
     welcome_text = (
-        f"🌐 **Flexiroam 自动化助手 (手动模式)**\n"
+        f"🌐 **Flexiroam 自动化助手**\n"
         f"你好，{user.first_name}！\n"
-        f"🚀 **使用步骤**：\n1. 准备邮箱\n2. 点击“开始新任务”\n3. 注册 -> 验证 -> 自动执行"
+        f"🚀 **使用步骤**：\n1. 准备邮箱和密码\n2. 点击“开始新任务”\n3. 注册 -> 验证 -> 自动执行"
     )
     keyboard = [
         [InlineKeyboardButton("🚀 开始新任务", callback_data="btn_start_task")],
@@ -497,12 +498,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"👤 **我的信息**\nID: `{user.id}`\n权限: {auth}\n监控: {mon_stat}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="main_menu")]]), parse_mode='Markdown')
         return
 
-async def run_flexiroam_task(message, context, user, manual_email):
+async def run_flexiroam_task(message, context, user, manual_email, manual_password):
     try:
         user_manager.increment_usage(user.id, user.first_name)
         status_msg = await message.reply_text("⏳ 初始化环境...")
         session = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.get_session)
-        password = "Pass" + str(random.randint(10000,99999))
+        password = manual_password
         
         await status_msg.edit_text(f"🚀 **提交注册**\n📧 `{manual_email}`\n🔑 `{password}`", parse_mode='Markdown')
         reg_ok, reg_msg = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.register, session, manual_email, password)
@@ -578,9 +579,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "@" not in text or "." not in text:
             await update.message.reply_text("❌ 邮箱无效。")
             return
+        context.user_data['temp_email'] = text
+        context.user_data['state'] = STATE_WAIT_MANUAL_PASSWORD
+        await update.message.reply_text(f"✅ 邮箱: {text}\n🔑 **请输入密码：**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="main_menu")]]), parse_mode='Markdown')
+        return
+
+    if state == STATE_WAIT_MANUAL_PASSWORD:
+        password = text
+        email = context.user_data.get('temp_email')
+        if not email:
+            context.user_data['state'] = STATE_NONE
+            await update.message.reply_text("⚠️ 流程异常，请重新开始。", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="main_menu")]]))
+            return
+
         context.user_data['state'] = STATE_NONE
-        await update.message.reply_text(f"✅ 邮箱: {text}\n🚀 启动中...")
-        asyncio.create_task(run_flexiroam_task(update.message, context, user, manual_email=text))
+        await update.message.reply_text(f"✅ 密码已接收\n🚀 启动中...")
+        asyncio.create_task(run_flexiroam_task(update.message, context, user, manual_email=email, manual_password=password))
         return
 
     if state in [STATE_WAIT_ADD_ID, STATE_WAIT_DEL_ID]:
