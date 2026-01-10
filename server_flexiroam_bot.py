@@ -131,53 +131,6 @@ class UserManager:
 
 user_manager = UserManager()
 
-# ================= 临时邮箱工具类 (Mail.tm) =================
-class MailTm:
-    BASE_URL = "https://api.mail.tm"
-
-    @staticmethod
-    def create_account():
-        try:
-            time.sleep(random.uniform(0.5, 1.5))
-            domains_resp = requests.get(f"{MailTm.BASE_URL}/domains", timeout=10)
-            if domains_resp.status_code != 200: return None, None
-            
-            domains = domains_resp.json().get('hydra:member', [])
-            if not domains: return None, None
-            domain = domains[0]['domain'] 
-
-            username = "".join(random.choices("abcdefghijklmnopqrstuvwxyz1234567890", k=10))
-            password = "".join(random.choices("abcdefghijklmnopqrstuvwxyz1234567890", k=12))
-            address = f"{username}@{domain}"
-
-            reg_resp = requests.post(f"{MailTm.BASE_URL}/accounts", json={"address": address, "password": password}, timeout=10)
-            if reg_resp.status_code != 201: return None, None
-
-            token_resp = requests.post(f"{MailTm.BASE_URL}/token", json={"address": address, "password": password}, timeout=10)
-            if token_resp.status_code != 200: return None, None
-
-            return address, token_resp.json().get('token')
-        except: return None, None
-
-    @staticmethod
-    def check_inbox(token):
-        if not token: return []
-        headers = {"Authorization": f"Bearer {token}"}
-        try:
-            resp = requests.get(f"{MailTm.BASE_URL}/messages", headers=headers, timeout=10)
-            if resp.status_code == 200: return resp.json().get('hydra:member', [])
-            return []
-        except: return []
-
-    @staticmethod
-    def get_message_content(token, msg_id):
-        headers = {"Authorization": f"Bearer {token}"}
-        try:
-            resp = requests.get(f"{MailTm.BASE_URL}/messages/{msg_id}", headers=headers, timeout=10)
-            if resp.status_code == 200: return resp.json()
-            return None
-        except: return None
-
 # ================= Flexiroam 业务逻辑 =================
 JWT_APP_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJjbGllbnRfaWQiOjQsImZpcnN0X25hbWUiOiJUcmF2ZWwiLCJsYXN0X25hbWUiOiJBcHAiLCJlbWFpbCI6InRyYXZlbGFwcEBmbGV4aXJvYW0uY29tIiwidHlwZSI6IkNsaWVudCIsImFjY2Vzc190eXBlIjoiQXBwIiwidXNlcl9hY2NvdW50X2lkIjo2LCJ1c2VyX3JvbGUiOiJWaWV3ZXIiLCJwZXJtaXNzaW9uIjpbXSwiZXhwaXJlIjoxODc5NjcwMjYwfQ.-RtM_zNG-zBsD_S2oOEyy4uSbqR7wReAI92gp9uh-0Y"
 CARDBIN = "528911"
@@ -216,17 +169,6 @@ class FlexiroamLogic:
         try:
             res = session.post(url, headers=headers, json=payload, timeout=20)
             return res.status_code in [200, 201], res.text
-        except Exception as e: return False, str(e)
-
-    @staticmethod
-    def verify_email_token(session, token):
-        try:
-            link = f"https://www.flexiroam.com/en-us/verify?token={token}"
-            session.get(link, timeout=15)
-            api_url = "https://prod-enduserservices.flexiroam.com/api/registration/verify"
-            headers = {"authorization": "Bearer " + JWT_APP_TOKEN, "content-type": "application/json"}
-            res = session.post(api_url, headers=headers, json={"token": token}, timeout=15)
-            return True, "Verified"
         except Exception as e: return False, str(e)
 
     @staticmethod
@@ -401,12 +343,11 @@ class MonitoringManager:
                         if ok:
                             try: await context.bot.send_message(user_id, "✅ 自动激活成功！")
                             except: pass
-                            # 激活成功后休息一会，避免重复
                             await asyncio.sleep(10)
                             continue
                     
                     # --- 逻辑 B: 自动补货 (当库存不足 2 张 且 冷却时间已过) ---
-                    # 每天限制领 4 次左右防止风控
+                    # 每天限制领 5 次左右
                     current_time = datetime.now()
                     if inactive_count < 2 and day_get_count < 5:
                         if (current_time - last_get_time) >= timedelta(minutes=1):
@@ -422,14 +363,11 @@ class MonitoringManager:
                                 try: await context.bot.send_message(user_id, f"✅ 领卡成功！(今日第 {day_get_count} 张)")
                                 except: pass
                                 
-                                # 领完后，如果有激活需求，会在下个循环处理；
-                                # 或者也可以立即尝试激活：
                                 await asyncio.sleep(5)
                                 if total_active_pct <= 30:
                                     await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.start_plan, session, token)
                                 
                             elif "Processing" in r_msg:
-                                # 订单处理中，不计数但重置时间
                                 pass
                 
                 except asyncio.CancelledError:
@@ -461,18 +399,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['state'] = STATE_NONE 
     
     welcome_text = (
-        f"🌐 **Flexiroam 自动化助手**\n\n"
+        f"🌐 **Flexiroam 自动化助手 (手动模式)**\n\n"
         f"你好，{user.first_name}！\n"
-        f"此机器人可协助全自动注册、领卡、并**后台监控流量自动续订**。\n\n"
-        f"🚀 **功能特色**：\n"
-        f"• 自动注册 & 接码 (Mail.tm)\n"
-        f"• 自动兑换 MasterCard 权益\n"
-        f"• **24小时后台流量监控 & 自动激活**"
+        f"此机器人可协助注册、领卡、并**后台监控流量自动续订**。\n\n"
+        f"🚀 **使用步骤**：\n"
+        f"1. 准备一个可用邮箱\n"
+        f"2. 点击“开始新任务”\n"
+        f"3. 机器人提交注册 -> 你点击邮件验证 -> 机器人完成剩余步骤"
     )
     
     keyboard = [
-        [InlineKeyboardButton("🚀 一键全自动 (推荐)", callback_data="btn_auto_task")],
-        [InlineKeyboardButton("📧 手动输入邮箱", callback_data="btn_manual_email")],
+        [InlineKeyboardButton("🚀 开始新任务", callback_data="btn_start_task")],
         [InlineKeyboardButton("📊 监控管理", callback_data="btn_monitor_menu")],
         [InlineKeyboardButton("👤 状态查询", callback_data="btn_my_info")]
     ]
@@ -537,7 +474,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- 任务入口 ---
-    if data in ["btn_auto_task", "btn_manual_email"]:
+    if data == "btn_start_task":
         if not user_manager.get_config("bot_active", True) and user.id != ADMIN_ID:
              await query.edit_message_text("⚠️ **维护中**\n管理员暂停了服务。", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="main_menu")]]))
              return
@@ -546,11 +483,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("🚫 **未授权**\n请联系管理员开通权限。", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="main_menu")]]))
             return
         
-        if data == "btn_auto_task":
-            asyncio.create_task(run_flexiroam_task(query.message, context, user, auto_mail=True))
-        else:
-            context.user_data['state'] = STATE_WAIT_MANUAL_EMAIL
-            await query.edit_message_text("📧 **请输入您要注册的邮箱地址：**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="main_menu")]]), parse_mode='Markdown')
+        context.user_data['state'] = STATE_WAIT_MANUAL_EMAIL
+        await query.edit_message_text("📧 **请输入您要使用的邮箱地址：**\n(例如: abc@gmail.com)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="main_menu")]]), parse_mode='Markdown')
         return
     
     # --- 管理功能 ---
@@ -595,77 +529,36 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"👤 **我的信息**\nID: `{user.id}`\n权限: {auth}\n使用次数: {cnt}\n监控任务: {mon_stat}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="main_menu")]]), parse_mode='Markdown')
         return
 
-async def run_flexiroam_task(message, context, user, auto_mail=True, manual_email=None):
-    """Flexiroam 核心自动化流程"""
+async def run_flexiroam_task(message, context, user, manual_email):
+    """Flexiroam 核心自动化流程 (纯手动邮箱版)"""
     try:
         user_manager.increment_usage(user.id, user.first_name)
         status_msg = await message.reply_text("⏳ **正在初始化环境...**\n🔄 配置代理与 Session...")
         
         session = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.get_session)
-        
-        # 1. 邮箱准备
-        if auto_mail:
-            await status_msg.edit_text("⏳ **正在申请临时邮箱 (Mail.tm)...**")
-            email, mail_token = await asyncio.get_running_loop().run_in_executor(None, MailTm.create_account)
-            if not email:
-                await status_msg.edit_text("❌ 申请邮箱失败，请稍后重试或使用手动邮箱模式。")
-                return
-        else:
-            email = manual_email
-            mail_token = None
-        
         password = "Pass" + str(random.randint(10000,99999))
         
-        # 2. 注册
-        await status_msg.edit_text(f"🚀 **正在注册账号**\n📧 `{email}`\n🔑 `{password}`\n⏳ 请求发送中...", parse_mode='Markdown')
-        reg_ok, reg_msg = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.register, session, email, password)
+        # 1. 注册
+        await status_msg.edit_text(f"🚀 **正在提交注册**\n📧 `{manual_email}`\n🔑 `{password}`\n⏳ 请求发送中...", parse_mode='Markdown')
+        reg_ok, reg_msg = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.register, session, manual_email, password)
         
         if not reg_ok:
             await status_msg.edit_text(f"❌ 注册请求失败: {reg_msg}")
             return
 
-        await status_msg.edit_text(f"✅ 注册请求已发送\n⏳ **等待验证邮件...**")
-
-        # 3. 验证 (自动/手动)
-        verify_success = False
+        # 2. 提示用户验证
+        await status_msg.edit_text(
+            f"📩 **注册请求已接受！**\n\n"
+            f"请执行以下步骤：\n"
+            f"1. 前往邮箱 `{manual_email}` 查收来自 Flexiroam 的邮件。\n"
+            f"2. **点击邮件中的 Verify 链接**。\n"
+            f"3. 确认验证成功后，点击下方按钮继续。",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ 我已完成验证", callback_data="btn_manual_verify_done")]]),
+            parse_mode='Markdown'
+        )
         
-        if auto_mail and mail_token:
-            # 自动轮询
-            start_time = time.time()
-            while time.time() - start_time < 120:
-                mails = await asyncio.get_running_loop().run_in_executor(None, MailTm.check_inbox, mail_token)
-                if mails:
-                    for m in mails:
-                        if "Verify" in m.get('subject', '') or "verify" in m.get('intro', ''):
-                            content = await asyncio.get_running_loop().run_in_executor(None, MailTm.get_message_content, mail_token, m['id'])
-                            body = str(content)
-                            match = re.search(r'token=([a-zA-Z0-9\-_]+)', body)
-                            if match:
-                                token = match.group(1)
-                                await status_msg.edit_text(f"🔎 捕获 Token: `{token[:10]}...`\n⏳ **正在验证...**", parse_mode='Markdown')
-                                v_ok, v_msg = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.verify_email_token, session, token)
-                                if v_ok:
-                                    verify_success = True
-                                    break
-                if verify_success: break
-                await asyncio.sleep(5)
-                
-            if not verify_success:
-                await status_msg.edit_text("❌ 自动验证超时 (未收到邮件或解析失败)。")
-                return
-        else:
-            await status_msg.edit_text(
-                f"📩 **验证邮件已发送！**\n\n"
-                f"请前往邮箱 `{email}` 查收来自 Flexiroam 的邮件。\n"
-                f"⚠️ **请点击邮件中的链接完成验证**，完成后点击下方按钮继续。",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ 我已完成验证", callback_data="btn_manual_verify_done")]]),
-                parse_mode='Markdown'
-            )
-            context.user_data['pending_task'] = {'session': session, 'email': email, 'password': password}
-            return
-
-        # 4. 继续后续流程
-        await finish_flexiroam_task(status_msg, context, user, session, email, password)
+        # 暂存数据，等待回调
+        context.user_data['pending_task'] = {'session': session, 'email': manual_email, 'password': password}
 
     except Exception as e:
         logger.error(traceback.format_exc())
@@ -682,17 +575,15 @@ async def manual_verify_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
     
     del context.user_data['pending_task']
-    await query.edit_message_text("✅ 收到确认，正在继续执行...")
+    await query.edit_message_text("✅ 收到确认，正在登录系统...")
     
     await finish_flexiroam_task(query.message, context, update.effective_user, data['session'], data['email'], data['password'])
 
 async def finish_flexiroam_task(message, context, user, session, email, password):
     """后半段流程：登录 -> 兑换 -> 激活 -> 询问监控"""
     try:
-        await message.edit_text(f"🔐 **正在登录...**\n📧 `{email}`", parse_mode='Markdown')
-        
         app_token = None
-        for _ in range(3):
+        for i in range(3):
             l_ok, l_data = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.login, session, email, password)
             if l_ok:
                 app_token = l_data['token']
@@ -700,7 +591,7 @@ async def finish_flexiroam_task(message, context, user, session, email, password
             await asyncio.sleep(2)
             
         if not app_token:
-            await message.edit_text(f"❌ 登录失败 (可能验证有延迟，请稍后手动尝试登录)。")
+            await message.edit_text(f"❌ 登录失败 (请确认您确实已点击邮件中的验证链接)。")
             return
 
         # 兑换
@@ -755,7 +646,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data['state'] = STATE_NONE
         await update.message.reply_text(f"✅ 确认邮箱: {text}\n🚀 任务启动中...")
-        asyncio.create_task(run_flexiroam_task(update.message, context, user, auto_mail=False, manual_email=text))
+        asyncio.create_task(run_flexiroam_task(update.message, context, user, manual_email=text))
         return
 
     if state in [STATE_WAIT_ADD_ID, STATE_WAIT_DEL_ID]:
@@ -789,5 +680,5 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    print("🚀 Flexiroam Bot Started...")
+    print("🚀 Flexiroam Bot Started (Manual Email Mode)...")
     app.run_polling()
