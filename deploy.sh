@@ -3,7 +3,7 @@
 # ================= 配置区 =================
 # ⚠️ 请修改这里为你上传代码的 GitHub Raw 地址或实际存放地址
 # 假设你将 server_flexiroam_bot.py 和 requirements.txt 放在同一仓库
-REPO_URL="https://raw.githubusercontent.com/你的用户名/你的仓库/main" 
+REPO_URL="https://raw.githubusercontent.com/2019xuanying/flexiroam/main" 
 INSTALL_DIR="/root/flexiroam_bot"
 
 # ================= 脚本逻辑 =================
