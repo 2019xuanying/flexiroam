@@ -12,15 +12,15 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 echo "======================================"
-echo "   Flexiroam Bot - 全自动部署 (写入版)"
+echo "   Flexiroam Bot - 登录版部署 (更新)"
 echo "======================================"
 
 # 1. 准备目录
-echo "[1/6] 创建安装目录: $INSTALL_DIR"
+echo "[1/6] 检查安装目录: $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR" || exit
 
-# 2. 写入 Python 主程序 (嵌入式)
+# 2. 写入 Python 主程序 (嵌入式 - 已去除注册功能，优化监控)
 echo "[2/6] 正在生成 server_flexiroam_bot.py ..."
 
 cat << 'EOF_PY' > "$INSTALL_DIR/server_flexiroam_bot.py"
@@ -175,29 +175,6 @@ class FlexiroamLogic:
         return session
 
     @staticmethod
-    def register(session, email, password):
-        url = "https://prod-enduserservices.flexiroam.com/api/registration/request/create"
-        headers = {
-            "authorization": "Bearer " + JWT_APP_TOKEN,
-            "content-type": "application/json",
-            "lang": "en-us",
-            "origin": "https://www.flexiroam.com",
-            "referer": "https://www.flexiroam.com/en-us/signup"
-        }
-        payload = {
-            "email": email,
-            "password": password,
-            "first_name": "Traveler",
-            "last_name": "Bot",
-            "home_country_code": "CN",
-            "language_preference": "en-us"
-        }
-        try:
-            res = session.post(url, headers=headers, json=payload, timeout=20)
-            return res.status_code in [200, 201], res.text
-        except Exception as e: return False, str(e)
-
-    @staticmethod
     def login(session, email, password):
         url = "https://prod-enduserservices.flexiroam.com/api/user/login"
         headers = {
@@ -299,7 +276,7 @@ class FlexiroamLogic:
             return False, f"Start Failed: {res.text}"
         except Exception as e: return False, f"Activate Error: {e}"
 
-# ================= 监控任务管理 =================
+# ================= 监控任务管理 (优化版) =================
 class MonitoringManager:
     def __init__(self):
         self.tasks = {} # user_id -> task
@@ -321,16 +298,30 @@ class MonitoringManager:
         return user_id in self.tasks
 
     async def _monitor_loop(self, user_id, context, session, token, email):
-        logger.info(f"用户 {user_id} 开始监控...")
+        logger.info(f"用户 {user_id} 开始监控 (按需版)...")
+        
+        # === 配置区 ===
+        LOW_DATA_THRESHOLD = 30  # 剩余流量低于此百分比时触发
+        MAX_DAILY_REDEEM = 5     # 每天最多领几张
+        # =============
+        
         day_get_count = 0
         last_get_time = datetime.now() - timedelta(hours=8)
+        current_date = datetime.now().date()
         
         try:
             while True:
                 try:
+                    # 0. 每日重置计数器
+                    if datetime.now().date() != current_date:
+                        day_get_count = 0
+                        current_date = datetime.now().date()
+
+                    # 1. 保活 Session
                     try: session.get("https://www.flexiroam.com/api/auth/session", timeout=10)
                     except: pass
 
+                    # 2. 获取计划
                     res, plans_data = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.get_plans, session)
                     if not res:
                         await asyncio.sleep(30)
@@ -340,38 +331,55 @@ class MonitoringManager:
                     active_plans = [p for p in plans_list if p["status"] == 'Active']
                     inactive_plans = [p for p in plans_list if p["status"] == 'In-active']
                     
-                    total_active_pct = sum(p["circleChart"]["percentage"] for p in active_plans)
+                    if not active_plans:
+                        total_active_pct = 0
+                    else:
+                        total_active_pct = sum(p.get("circleChart", {}).get("percentage", 0) for p in active_plans)
+                    
                     inactive_count = len(inactive_plans)
                     
-                    # 自动激活
-                    if total_active_pct <= 30 and inactive_count > 0:
-                        target_id = inactive_plans[0]["planId"]
-                        try: await context.bot.send_message(user_id, f"📉 流量告急 ({total_active_pct}%)，激活新套餐...")
-                        except: pass
+                    # === 核心逻辑优化：只有流量不足时才行动 ===
+                    if total_active_pct <= LOW_DATA_THRESHOLD:
+                        msg_prefix = f"📉 流量告急 ({total_active_pct}%)"
                         
-                        ok, res_msg = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.start_plan, session, token, target_id)
-                        if ok:
-                            try: await context.bot.send_message(user_id, "✅ 自动激活成功！")
-                            except: pass
-                            await asyncio.sleep(10)
-                            continue
-                    
-                    # 自动补货
-                    current_time = datetime.now()
-                    if inactive_count < 2 and day_get_count < 5:
-                        if (current_time - last_get_time) >= timedelta(minutes=1):
-                            try: await context.bot.send_message(user_id, f"📦 库存不足 ({inactive_count})，自动领卡...")
+                        if inactive_count > 0:
+                            # --- 场景 A: 有库存，直接激活 ---
+                            target_id = inactive_plans[0]["planId"]
+                            try: await context.bot.send_message(user_id, f"{msg_prefix}，消耗库存激活中 (ID: {target_id})...")
                             except: pass
                             
-                            r_ok, r_msg = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.redeem_code, session, token, email)
-                            if r_ok:
-                                day_get_count += 1
-                                last_get_time = current_time
-                                try: await context.bot.send_message(user_id, f"✅ 领卡成功！(今日第 {day_get_count} 张)")
+                            ok, res_msg = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.start_plan, session, token, target_id)
+                            
+                            if ok:
+                                try: await context.bot.send_message(user_id, "✅ 激活成功！")
                                 except: pass
-                                await asyncio.sleep(5)
-                                if total_active_pct <= 30:
-                                    await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.start_plan, session, token)
+                                await asyncio.sleep(20) 
+                                continue 
+                            else:
+                                try: await context.bot.send_message(user_id, f"⚠️ 激活失败: {res_msg}")
+                                except: pass
+                        
+                        else:
+                            # --- 场景 B: 无库存，紧急领卡 ---
+                            if day_get_count < MAX_DAILY_REDEEM:
+                                current_time = datetime.now()
+                                if (current_time - last_get_time) >= timedelta(minutes=1):
+                                    try: await context.bot.send_message(user_id, f"{msg_prefix}且无库存，正在紧急补货...")
+                                    except: pass
+                                    
+                                    r_ok, r_msg = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.redeem_code, session, token, email)
+                                    
+                                    if r_ok:
+                                        day_get_count += 1
+                                        last_get_time = current_time
+                                        try: await context.bot.send_message(user_id, f"✅ 补货成功 (今日第 {day_get_count} 张)，等待下轮激活...")
+                                        except: pass
+                                    else:
+                                        pass
+                            else:
+                                pass
+                    
+                    # 流量充足，什么都不做
                 
                 except asyncio.CancelledError: raise
                 except Exception as e: logger.error(f"Monitor loop error user {user_id}: {e}")
@@ -388,7 +396,7 @@ STATE_NONE = 0
 STATE_WAIT_ADD_ID = 1
 STATE_WAIT_DEL_ID = 2
 STATE_WAIT_MANUAL_EMAIL = 3
-STATE_WAIT_MANUAL_PASSWORD = 4
+STATE_WAIT_MANUAL_PASSWORD = 4 # 新增状态
 
 PERSISTENT_KEYBOARD = ReplyKeyboardMarkup([["☰ 菜单"]], resize_keyboard=True, is_persistent=True)
 
@@ -397,9 +405,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['state'] = STATE_NONE 
     
     welcome_text = (
-        f"🌐 **Flexiroam 自动化助手**\n"
-        f"你好，{user.first_name}！\n"
-        f"🚀 **使用步骤**：\n1. 准备邮箱和密码\n2. 点击“开始新任务”\n3. 注册 -> 验证 -> 自动执行"
+        f"🌐 **Flexiroam 助手 (登录版)**\n"
+        f"你好，{user.first_name}！\n\n"
+        f"🤖 **功能：**\n"
+        f"1. 登录现有账号\n2. 自动领取权益(如果符合条件)\n3. 后台监控：仅在流量不足时自动补货/激活\n\n"
+        f"🚀 **使用步骤**：\n点击“开始新任务” -> 输入邮箱 -> 输入密码"
     )
     keyboard = [
         [InlineKeyboardButton("🚀 开始新任务", callback_data="btn_start_task")],
@@ -432,7 +442,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = []
         if is_running: keyboard.append([InlineKeyboardButton("🛑 停止监控", callback_data="btn_stop_monitor")])
         keyboard.append([InlineKeyboardButton("🔙 返回", callback_data="main_menu")])
-        await query.edit_message_text(f"📊 **流量监控状态**\n状态: {status}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        await query.edit_message_text(f"📊 **流量监控状态**\n状态: {status}\n策略: 流量<30%时自动补货激活", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return
 
     if data == "btn_stop_monitor":
@@ -443,10 +453,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "btn_start_monitor_confirm":
         monitor_data = context.user_data.get('monitor_data')
         if not monitor_data:
-            await query.edit_message_text("⚠️ 会话已过期，请重新运行任务。")
+            await query.edit_message_text("⚠️ 会话已过期，请重新登录。")
             return
         monitor_manager.start_monitor(user.id, context, monitor_data['session'], monitor_data['token'], monitor_data['email'])
-        await query.edit_message_text("✅ **后台监控已启动！**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="main_menu")]]))
+        await query.edit_message_text("✅ **后台监控已启动！**\n模式: 智能补货 (流量不足才触发)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="main_menu")]]))
         return
 
     if data == "btn_start_task":
@@ -456,8 +466,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user_manager.is_authorized(user.id):
             await query.edit_message_text("🚫 未授权。", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="main_menu")]]))
             return
+        
+        # 流程第一步：输入邮箱
         context.user_data['state'] = STATE_WAIT_MANUAL_EMAIL
-        await query.edit_message_text("📧 **请输入您要使用的邮箱地址：**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="main_menu")]]), parse_mode='Markdown')
+        await query.edit_message_text("📧 **请输入账号邮箱：**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="main_menu")]]), parse_mode='Markdown')
         return
     
     if data == "btn_admin_menu":
@@ -498,73 +510,55 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"👤 **我的信息**\nID: `{user.id}`\n权限: {auth}\n监控: {mon_stat}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="main_menu")]]), parse_mode='Markdown')
         return
 
-async def run_flexiroam_task(message, context, user, manual_email, manual_password):
+async def execute_login_flow(message, context, user, email, password):
+    """执行登录逻辑"""
     try:
         user_manager.increment_usage(user.id, user.first_name)
-        status_msg = await message.reply_text("⏳ 初始化环境...")
-        session = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.get_session)
-        password = manual_password
+        status_msg = await message.reply_text(f"⏳ **正在登录...**\n账号: `{email}`")
         
-        await status_msg.edit_text(f"🚀 **提交注册**\n📧 `{manual_email}`\n🔑 `{password}`", parse_mode='Markdown')
-        reg_ok, reg_msg = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.register, session, manual_email, password)
-        if not reg_ok:
-            await status_msg.edit_text(f"❌ 注册失败: {reg_msg}")
-            return
-
-        await status_msg.edit_text(
-            f"📩 **注册成功！请去邮箱点击链接验证**\n验证完成后点击下方按钮。",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ 我已完成验证", callback_data="btn_manual_verify_done")]]),
-            parse_mode='Markdown'
-        )
-        context.user_data['pending_task'] = {'session': session, 'email': manual_email, 'password': password}
-
-    except Exception as e:
-        logger.error(traceback.format_exc())
-        try: await status_msg.edit_text(f"💥 异常: {e}")
-        except: pass
-
-async def manual_verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = context.user_data.get('pending_task')
-    if not data:
-        await query.edit_message_text("⚠️ 会话过期。")
-        return
-    del context.user_data['pending_task']
-    await query.edit_message_text("✅ 收到确认，正在登录...")
-    await finish_flexiroam_task(query.message, context, update.effective_user, data['session'], data['email'], data['password'])
-
-async def finish_flexiroam_task(message, context, user, session, email, password):
-    try:
+        session = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.get_session)
+        
+        # 1. 登录
         app_token = None
-        for i in range(3):
+        for i in range(2):
             l_ok, l_data = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.login, session, email, password)
             if l_ok:
                 app_token = l_data['token']
                 break
-            await asyncio.sleep(2)
-            
+            await asyncio.sleep(1)
+        
         if not app_token:
-            await message.edit_text(f"❌ 登录失败 (请确认已点击验证链接)。")
+            await status_msg.edit_text(f"❌ **登录失败**\n请检查邮箱或密码是否正确。")
             return
 
-        await message.edit_text("🎁 正在兑换...")
+        # 2. 尝试兑换（顺手薅一次）
+        await status_msg.edit_text("✅ 登录成功！\n🎁 正在检查权益...")
         r_ok, r_msg = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.redeem_code, session, app_token, email)
+        redeem_status = "领取成功" if r_ok else f"跳过 ({r_msg})"
+
+        # 3. 检查是否需要激活（虽然监控会做，但这里可以先做一次检查）
+        await status_msg.edit_text(f"🎁 {redeem_status}\n🔄 正在同步套餐信息...")
+        await asyncio.sleep(2)
         
-        status_text = f"✅ 兑换成功" if r_ok else f"⚠️ 兑换: {r_msg}"
-        await message.edit_text(f"{status_text}\n⏳ 正在激活...")
-        
-        await asyncio.sleep(3) 
-        s_ok, s_msg = await asyncio.get_running_loop().run_in_executor(None, FlexiroamLogic.start_plan, session, app_token)
-        
+        # 准备监控数据
         context.user_data['monitor_data'] = {'session': session, 'token': app_token, 'email': email}
-        act_text = "✅ 激活成功" if s_ok else f"⚠️ 激活: {s_msg}"
         
-        await message.edit_text(f"🎉 **任务完成！**\n{status_text}\n{act_text}\n\n📡 **启动后台监控？**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ 启动监控", callback_data="btn_start_monitor_confirm")]]), parse_mode='Markdown')
+        result_text = (
+            f"🎉 **操作完成！**\n"
+            f"📧 账号: `{email}`\n"
+            f"🎁 权益: {redeem_status}\n\n"
+            f"📡 **启动智能监控？**\n"
+            f"策略: 流量充足时待机，不足 30% 时自动消耗库存或领卡。"
+        )
+        await status_msg.edit_text(
+            result_text, 
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ 启动监控", callback_data="btn_start_monitor_confirm")]]), 
+            parse_mode='Markdown'
+        )
 
     except Exception as e:
         logger.error(traceback.format_exc())
-        await message.edit_text(f"💥 异常: {e}")
+        await status_msg.edit_text(f"💥 系统异常: {e}")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
@@ -575,15 +569,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start(update, context)
         return
 
+    # 1. 输入邮箱
     if state == STATE_WAIT_MANUAL_EMAIL:
         if "@" not in text or "." not in text:
-            await update.message.reply_text("❌ 邮箱无效。")
+            await update.message.reply_text("❌ 邮箱无效，请重新输入：")
             return
         context.user_data['temp_email'] = text
-        context.user_data['state'] = STATE_WAIT_MANUAL_PASSWORD
+        context.user_data['state'] = STATE_WAIT_MANUAL_PASSWORD # 转移到输入密码状态
         await update.message.reply_text(f"✅ 邮箱: {text}\n🔑 **请输入密码：**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="main_menu")]]), parse_mode='Markdown')
         return
 
+    # 2. 输入密码
     if state == STATE_WAIT_MANUAL_PASSWORD:
         password = text
         email = context.user_data.get('temp_email')
@@ -593,10 +589,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         context.user_data['state'] = STATE_NONE
-        await update.message.reply_text(f"✅ 密码已接收\n🚀 启动中...")
-        asyncio.create_task(run_flexiroam_task(update.message, context, user, manual_email=email, manual_password=password))
+        # 删除用户发送的密码消息以保护隐私（如果机器人有权限）
+        try: await update.message.delete()
+        except: pass
+        
+        # 开始执行登录流程
+        asyncio.create_task(execute_login_flow(update.message, context, user, email, password))
         return
 
+    # 管理员功能
     if state in [STATE_WAIT_ADD_ID, STATE_WAIT_DEL_ID]:
         if user.id != ADMIN_ID: return
         context.user_data['state'] = STATE_NONE
@@ -617,16 +618,21 @@ async def post_init(app):
     await app.bot.set_my_commands([BotCommand("start", "主菜单")])
 
 if __name__ == '__main__':
+    if not BOT_TOKEN:
+        print("请在 .env 设置 TG_BOT_TOKEN")
+        sys.exit()
+
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(manual_verify_callback, pattern="^btn_manual_verify_done$"))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    print("🚀 Flexiroam Bot (Login Mode) Started...")
     app.run_polling()
 EOF_PY
 
-# 3. 写入依赖文件
-echo "[3/6] 正在生成 requirements.txt ..."
+# 3. 写入依赖文件 (保持不变)
+echo "[3/6] 检查 requirements.txt ..."
 cat << 'EOF_REQ' > "$INSTALL_DIR/requirements.txt"
 python-telegram-bot>=20.0
 requests
@@ -636,7 +642,6 @@ EOF_REQ
 
 # 4. 环境安装
 echo "[4/6] 安装 Python 虚拟环境..."
-# 检查是否已安装 python3-venv
 apt-get update >/dev/null 2>&1
 apt-get install -y python3 python3-pip python3-venv >/dev/null 2>&1
 
@@ -648,7 +653,7 @@ echo "[5/6] 安装 pip 依赖..."
 ./venv/bin/pip install --upgrade pip >/dev/null 2>&1
 ./venv/bin/pip install -r requirements.txt >/dev/null 2>&1
 
-# 5. 配置 .env (如果不存在)
+# 5. 配置 .env
 ENV_FILE=".env"
 if [ ! -f "$ENV_FILE" ]; then
     echo ""
@@ -660,6 +665,8 @@ if [ ! -f "$ENV_FILE" ]; then
     echo "TG_BOT_TOKEN=$input_token" > "$ENV_FILE"
     echo "TG_ADMIN_ID=$input_admin_id" >> "$ENV_FILE"
     echo "✅ 配置已保存到 .env"
+else
+    echo "✅ .env 配置文件已存在，跳过配置。"
 fi
 
 # 6. 重启服务
@@ -688,6 +695,6 @@ systemctl enable flexiroam_bot
 systemctl restart flexiroam_bot
 
 echo "======================================"
-echo "   🎉 修复完成！机器人已重启"
+echo "   🎉 更新完成！"
 echo "   查看日志: journalctl -u flexiroam_bot -f"
 echo "======================================"
